@@ -78,8 +78,15 @@ func parseTemperatureFromBytes(data []byte, start, end int) (int32, bool) {
 	return sign * (intPart*10 + fracPart), true
 }
 
+// stationIntern holds station name interning data for a worker
+type stationIntern struct {
+	nameToID map[string]int
+	idToName []string
+	stats    []stationStats
+}
+
 // processChunk walks over data[start:end) and returns local aggregates.
-func processChunk(data []byte, start, end int) map[string]stationStats {
+func processChunk(data []byte, start, end int) *stationIntern {
 	// ensure we start at a line boundary (caller guarantees start==0 for the
 	// very first chunk)
 	if start != 0 {
@@ -88,7 +95,12 @@ func processChunk(data []byte, start, end int) map[string]stationStats {
 		}
 	}
 
-	local := make(map[string]stationStats)
+	// Initialize station interning structures
+	intern := &stationIntern{
+		nameToID: make(map[string]int, 512), // pre-size for ~500 stations
+		idToName: make([]string, 0, 512),
+		stats:    make([]stationStats, 0, 512),
+	}
 
 	i := start
 	for i < end {
@@ -127,10 +139,21 @@ func processChunk(data []byte, start, end int) map[string]stationStats {
 			continue // skip invalid values
 		}
 
-		// Station name - only allocate string when needed for map key
-		station := string(line[:semicolonIdx])
+		// Station name interning - only allocate string for new stations
+		stationBytes := line[:semicolonIdx]
+		stationName := string(stationBytes) // potential allocation
 
-		stats := local[station]
+		stationID, exists := intern.nameToID[stationName]
+		if !exists {
+			// New station - intern it
+			stationID = len(intern.idToName)
+			intern.nameToID[stationName] = stationID
+			intern.idToName = append(intern.idToName, stationName)
+			intern.stats = append(intern.stats, stationStats{})
+		}
+
+		// Update stats using fast array access
+		stats := &intern.stats[stationID]
 		if stats.count == 0 {
 			stats.min, stats.max = temp, temp
 		} else {
@@ -143,10 +166,9 @@ func processChunk(data []byte, start, end int) map[string]stationStats {
 		}
 		stats.sum += int64(temp)
 		stats.count++
-		local[station] = stats
 	}
 
-	return local
+	return intern
 }
 
 func main() {
@@ -199,7 +221,7 @@ func main() {
 	chunkSize := int(fileSize) / workerCount
 
 	var wg sync.WaitGroup
-	resultsCh := make(chan map[string]stationStats, workerCount)
+	resultsCh := make(chan *stationIntern, workerCount)
 
 	for i := 0; i < workerCount; i++ {
 		start := i * chunkSize
@@ -221,9 +243,11 @@ func main() {
 	}()
 
 	globalStats := make(map[string]stationStats)
-	for local := range resultsCh {
-		for station, stats := range local {
-			g := globalStats[station]
+	for workerData := range resultsCh {
+		// Merge each worker's interned stations into global stats
+		for stationID, stats := range workerData.stats {
+			stationName := workerData.idToName[stationID]
+			g := globalStats[stationName]
 			if g.count == 0 {
 				g.min, g.max = stats.min, stats.max
 			} else {
@@ -236,7 +260,7 @@ func main() {
 			}
 			g.sum += stats.sum
 			g.count += stats.count
-			globalStats[station] = g
+			globalStats[stationName] = g
 		}
 	}
 
