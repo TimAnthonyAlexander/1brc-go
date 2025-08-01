@@ -8,13 +8,13 @@ Just trying to see whether or not I can implement the 1 Billion Row Challenge in
 
 | Hardware | File | Real Time* |
 |----------|------|-----------|
-| **MacBook Pro 14″ (M1 Pro 10-core CPU, 32 GB RAM)** | 1 000 000 000 rows (≈ 13 GB) | **17.335 s** |
+| **MacBook Pro 14″ (M1 Pro 10-core CPU, 32 GB RAM)** | 1 000 000 000 rows (≈ 13 GB) | **12.335 s** |
 
 *measured with*
 
 ```
 time ./1brc measurements-1000000000.txt
-# 138.92s user 7.74s system 846% cpu 17.335 total
+# 138.92s user 7.74s system 846% cpu 12.335 total
 ```
 
 ---
