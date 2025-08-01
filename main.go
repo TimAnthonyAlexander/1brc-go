@@ -1,17 +1,17 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"runtime"
 	"sort"
 	"sync"
+	"syscall"
 )
 
+// stationStats keeps running aggregates for one weather station.
 type stationStats struct {
 	min   float64
 	max   float64
@@ -19,6 +19,9 @@ type stationStats struct {
 	count int
 }
 
+// parseTemperature parses a temperature value known to contain at most one
+// decimal place. A custom parser avoids the overhead of strconv.ParseFloat in
+// the hot path.
 func parseTemperature(buf []byte) (float64, bool) {
 	if len(buf) == 0 {
 		return 0, false
@@ -31,6 +34,7 @@ func parseTemperature(buf []byte) (float64, bool) {
 		i++
 	}
 
+	// integral part
 	intPart := 0.0
 	for ; i < len(buf); i++ {
 		c := buf[i]
@@ -44,6 +48,7 @@ func parseTemperature(buf []byte) (float64, bool) {
 		intPart = intPart*10 + float64(c-'0')
 	}
 
+	// optional single decimal digit
 	fracPart := 0.0
 	if i < len(buf) {
 		c := buf[i]
@@ -56,62 +61,62 @@ func parseTemperature(buf []byte) (float64, bool) {
 	return sign * (intPart + fracPart), true
 }
 
-func processChunk(file *os.File, offset, length int64) map[string]stationStats {
-	section := io.NewSectionReader(file, offset, length)
-	reader := bufio.NewReaderSize(section, 1<<20)
-
-	if offset != 0 {
-		_, _ = reader.ReadBytes('\n')
+// processChunk walks over data[start:end) and returns local aggregates.
+func processChunk(data []byte, start, end int) map[string]stationStats {
+	// ensure we start at a line boundary (caller guarantees start==0 for the
+	// very first chunk)
+	if start != 0 {
+		for start < end && data[start-1] != '\n' {
+			start++
+		}
 	}
 
 	local := make(map[string]stationStats)
 
-	for {
-		line, err := reader.ReadBytes('\n')
-
-		if len(line) > 0 {
-
-			if line[len(line)-1] == '\n' {
-				line = line[:len(line)-1]
-			}
-			if len(line) == 0 {
-				goto checkErr
-			}
-
-			idx := bytes.IndexByte(line, ';')
-			if idx <= 0 || idx >= len(line)-1 {
-				goto checkErr
-			}
-
-			station := string(line[:idx])
-			tempBuf := line[idx+1:]
-
-			temp, ok := parseTemperature(tempBuf)
-			if !ok {
-				goto checkErr
-			}
-
-			stats := local[station]
-			if stats.count == 0 {
-				stats.min = temp
-				stats.max = temp
-			} else {
-				if temp < stats.min {
-					stats.min = temp
-				}
-				if temp > stats.max {
-					stats.max = temp
-				}
-			}
-			stats.sum += temp
-			stats.count++
-			local[station] = stats
-		}
-
-	checkErr:
-		if err != nil {
+	i := start
+	for i < end {
+		// find newline separating the current line
+		j := bytes.IndexByte(data[i:end], '\n')
+		var line []byte
+		if j == -1 {
+			// no complete line in the remaining slice – break; the next chunk
+			// (or EOF if last) will handle it
 			break
 		}
+		line = data[i : i+j]
+		i += j + 1 // move past "line + \n"
+
+		if len(line) == 0 {
+			continue // skip empty lines
+		}
+
+		idx := bytes.IndexByte(line, ';')
+		if idx <= 0 || idx >= len(line)-1 {
+			continue // malformed – ignore
+		}
+
+		station := string(line[:idx])
+		tempBuf := line[idx+1:]
+
+		temp, ok := parseTemperature(tempBuf)
+		if !ok {
+			continue // skip invalid values
+		}
+
+		stats := local[station]
+		if stats.count == 0 {
+			stats.min, stats.max = temp, temp
+		} else {
+			if temp < stats.min {
+				stats.min = temp
+			}
+			if temp > stats.max {
+				stats.max = temp
+			}
+		}
+		stats.sum += temp
+		stats.count++
+		local[station] = stats
 	}
 
 	return local
@@ -137,12 +142,26 @@ func main() {
 		os.Exit(1)
 	}
 	fileSize := fi.Size()
+	if fileSize == 0 {
+		return // nothing to do
+	}
+	if fileSize > int64(^uint(0)>>1) {
+		fmt.Fprintf(os.Stderr, "File too large to mmap on this platform\n")
+		os.Exit(1)
+	}
+
+	// mmap the file read-only
+	data, err := syscall.Mmap(int(file.Fd()), 0, int(fileSize), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to mmap file: %v\n", err)
+		os.Exit(1)
+	}
+	defer syscall.Munmap(data)
 
 	workerCount := runtime.NumCPU()
 	if workerCount < 1 {
 		workerCount = 1
 	}
-
 	if int64(workerCount) > fileSize {
 		workerCount = int(fileSize)
 	}
@@ -150,23 +169,23 @@ func main() {
 		workerCount = 1
 	}
 
-	chunkSize := fileSize / int64(workerCount)
+	chunkSize := int(fileSize) / workerCount
 
 	var wg sync.WaitGroup
 	resultsCh := make(chan map[string]stationStats, workerCount)
 
 	for i := 0; i < workerCount; i++ {
-		offset := int64(i) * chunkSize
-		length := chunkSize
+		start := i * chunkSize
+		end := start + chunkSize
 		if i == workerCount-1 {
-			length = fileSize - offset
+			end = int(fileSize)
 		}
 
 		wg.Add(1)
-		go func(off, size int64) {
+		go func(s, e int) {
 			defer wg.Done()
-			resultsCh <- processChunk(file, off, size)
-		}(offset, length)
+			resultsCh <- processChunk(data, s, e)
+		}(start, end)
 	}
 
 	go func() {
@@ -179,8 +198,7 @@ func main() {
 		for station, stats := range local {
 			g := globalStats[station]
 			if g.count == 0 {
-				g.min = stats.min
-				g.max = stats.max
+				g.min, g.max = stats.min, stats.max
 			} else {
 				if stats.min < g.min {
 					g.min = stats.min
