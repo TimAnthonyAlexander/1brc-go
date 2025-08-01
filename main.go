@@ -10,7 +10,6 @@ import (
 	"syscall"
 )
 
-// abs32 returns the absolute value of an int32
 func abs32(x int32) int32 {
 	if x < 0 {
 		return -x
@@ -18,7 +17,6 @@ func abs32(x int32) int32 {
 	return x
 }
 
-// abs64 returns the absolute value of an int64
 func abs64(x int64) int64 {
 	if x < 0 {
 		return -x
@@ -26,18 +24,13 @@ func abs64(x int64) int64 {
 	return x
 }
 
-// stationStats keeps running aggregates for one weather station.
-// All temperature values are stored as fixed-point integers (multiplied by 10).
 type stationStats struct {
 	min   int32
 	max   int32
-	sum   int64 // use int64 to avoid overflow with large sums
+	sum   int64
 	count int32
 }
 
-// parseTemperatureFromBytes parses a temperature value directly from a byte array
-// within the given range [start, end). Returns fixed-point integer (temperature * 10).
-// This avoids slice allocation by working with indices.
 func parseTemperatureFromBytes(data []byte, start, end int) (int32, bool) {
 	if start >= end {
 		return 0, false
@@ -50,7 +43,6 @@ func parseTemperatureFromBytes(data []byte, start, end int) (int32, bool) {
 		i++
 	}
 
-	// integral part
 	intPart := int32(0)
 	for ; i < end; i++ {
 		c := data[i]
@@ -64,7 +56,6 @@ func parseTemperatureFromBytes(data []byte, start, end int) (int32, bool) {
 		intPart = intPart*10 + int32(c-'0')
 	}
 
-	// optional single decimal digit
 	fracPart := int32(0)
 	if i < end {
 		c := data[i]
@@ -74,53 +65,45 @@ func parseTemperatureFromBytes(data []byte, start, end int) (int32, bool) {
 		fracPart = int32(c - '0')
 	}
 
-	// return fixed-point integer: (intPart * 10 + fracPart) * sign
 	return sign * (intPart*10 + fracPart), true
 }
 
-// stationIntern holds station name interning data for a worker
 type stationIntern struct {
 	nameToID map[string]int
 	idToName []string
 	stats    []stationStats
 }
 
-// processChunk walks over data[start:end) and returns local aggregates.
 func processChunk(data []byte, start, end int) *stationIntern {
-	// ensure we start at a line boundary (caller guarantees start==0 for the
-	// very first chunk)
+
 	if start != 0 {
 		for start < end && data[start-1] != '\n' {
 			start++
 		}
 	}
 
-	// Initialize station interning structures
 	intern := &stationIntern{
-		nameToID: make(map[string]int, 512), // pre-size for ~500 stations
+		nameToID: make(map[string]int, 512),
 		idToName: make([]string, 0, 512),
 		stats:    make([]stationStats, 0, 512),
 	}
 
 	i := start
 	for i < end {
-		// find newline separating the current line
+
 		j := bytes.IndexByte(data[i:end], '\n')
 		var line []byte
 		if j == -1 {
-			// no complete line in the remaining slice – break; the next chunk
-			// (or EOF if last) will handle it
+
 			break
 		}
 		line = data[i : i+j]
-		i += j + 1 // move past "line + \n"
+		i += j + 1
 
 		if len(line) == 0 {
-			continue // skip empty lines
+			continue
 		}
 
-		// Scan backwards from the end to find the semicolon
-		// This is faster than bytes.IndexByte which scans forward
 		semicolonIdx := -1
 		for i := len(line) - 1; i >= 0; i-- {
 			if line[i] == ';' {
@@ -130,29 +113,26 @@ func processChunk(data []byte, start, end int) *stationIntern {
 		}
 
 		if semicolonIdx <= 0 || semicolonIdx >= len(line)-1 {
-			continue // malformed – ignore
+			continue
 		}
 
-		// Parse temperature directly from the tail (no slice allocation)
 		temp, ok := parseTemperatureFromBytes(line, semicolonIdx+1, len(line))
 		if !ok {
-			continue // skip invalid values
+			continue
 		}
 
-		// Station name interning - only allocate string for new stations
 		stationBytes := line[:semicolonIdx]
-		stationName := string(stationBytes) // potential allocation
+		stationName := string(stationBytes)
 
 		stationID, exists := intern.nameToID[stationName]
 		if !exists {
-			// New station - intern it
+
 			stationID = len(intern.idToName)
 			intern.nameToID[stationName] = stationID
 			intern.idToName = append(intern.idToName, stationName)
 			intern.stats = append(intern.stats, stationStats{})
 		}
 
-		// Update stats using fast array access
 		stats := &intern.stats[stationID]
 		if stats.count == 0 {
 			stats.min, stats.max = temp, temp
@@ -192,14 +172,13 @@ func main() {
 	}
 	fileSize := fi.Size()
 	if fileSize == 0 {
-		return // nothing to do
+		return
 	}
 	if fileSize > int64(^uint(0)>>1) {
 		fmt.Fprintf(os.Stderr, "File too large to mmap on this platform\n")
 		os.Exit(1)
 	}
 
-	// mmap the file read-only
 	data, err := syscall.Mmap(int(file.Fd()), 0, int(fileSize), syscall.PROT_READ, syscall.MAP_SHARED)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to mmap file: %v\n", err)
@@ -244,7 +223,7 @@ func main() {
 
 	globalStats := make(map[string]stationStats)
 	for workerData := range resultsCh {
-		// Merge each worker's interned stations into global stats
+
 		for stationID, stats := range workerData.stats {
 			stationName := workerData.idToName[stationID]
 			g := globalStats[stationName]
@@ -273,10 +252,8 @@ func main() {
 	for _, station := range stations {
 		s := globalStats[station]
 
-		// Calculate mean in fixed-point, then round to nearest tenth
-		meanFixedPoint := (s.sum + int64(s.count)/2) / int64(s.count) // add half for rounding
+		meanFixedPoint := (s.sum + int64(s.count)/2) / int64(s.count)
 
-		// Convert fixed-point integers back to decimal format
 		minInt, minFrac := s.min/10, abs32(s.min%10)
 		meanInt, meanFrac := meanFixedPoint/10, abs64(meanFixedPoint%10)
 		maxInt, maxFrac := s.max/10, abs32(s.max%10)
