@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -142,6 +143,12 @@ func main() {
 	for _, station := range stations {
 		s := globalStats[station]
 		mean := s.sum / float64(s.count)
-		fmt.Printf("%s;%.1f/%.1f/%.1f\n", station, s.min, mean, s.max)
+
+		// Round values to one decimal place using half-away-from-zero rounding
+		minRounded := math.Round(s.min*10) / 10
+		meanRounded := math.Round(mean*10) / 10
+		maxRounded := math.Round(s.max*10) / 10
+
+		fmt.Printf("%s;%.1f/%.1f/%.1f\n", station, minRounded, meanRounded, maxRounded)
 	}
 }
