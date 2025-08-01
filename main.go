@@ -35,24 +35,25 @@ type stationStats struct {
 	count int32
 }
 
-// parseTemperature parses a temperature value known to contain at most one
-// decimal place. Returns fixed-point integer (temperature * 10) for fast integer math.
-func parseTemperature(buf []byte) (int32, bool) {
-	if len(buf) == 0 {
+// parseTemperatureFromBytes parses a temperature value directly from a byte array
+// within the given range [start, end). Returns fixed-point integer (temperature * 10).
+// This avoids slice allocation by working with indices.
+func parseTemperatureFromBytes(data []byte, start, end int) (int32, bool) {
+	if start >= end {
 		return 0, false
 	}
 
 	sign := int32(1)
-	i := 0
-	if buf[0] == '-' {
+	i := start
+	if data[i] == '-' {
 		sign = -1
 		i++
 	}
 
 	// integral part
 	intPart := int32(0)
-	for ; i < len(buf); i++ {
-		c := buf[i]
+	for ; i < end; i++ {
+		c := data[i]
 		if c == '.' {
 			i++
 			break
@@ -65,8 +66,8 @@ func parseTemperature(buf []byte) (int32, bool) {
 
 	// optional single decimal digit
 	fracPart := int32(0)
-	if i < len(buf) {
-		c := buf[i]
+	if i < end {
+		c := data[i]
 		if c < '0' || c > '9' {
 			return 0, false
 		}
@@ -115,7 +116,7 @@ func processChunk(data []byte, start, end int) map[string]stationStats {
 				break
 			}
 		}
-		
+
 		if semicolonIdx <= 0 || semicolonIdx >= len(line)-1 {
 			continue // malformed – ignore
 		}
