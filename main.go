@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -11,31 +10,47 @@ import (
 	"syscall"
 )
 
+// abs32 returns the absolute value of an int32
+func abs32(x int32) int32 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// abs64 returns the absolute value of an int64
+func abs64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
 // stationStats keeps running aggregates for one weather station.
+// All temperature values are stored as fixed-point integers (multiplied by 10).
 type stationStats struct {
-	min   float64
-	max   float64
-	sum   float64
-	count int
+	min   int32
+	max   int32
+	sum   int64 // use int64 to avoid overflow with large sums
+	count int32
 }
 
 // parseTemperature parses a temperature value known to contain at most one
-// decimal place. A custom parser avoids the overhead of strconv.ParseFloat in
-// the hot path.
-func parseTemperature(buf []byte) (float64, bool) {
+// decimal place. Returns fixed-point integer (temperature * 10) for fast integer math.
+func parseTemperature(buf []byte) (int32, bool) {
 	if len(buf) == 0 {
 		return 0, false
 	}
 
-	sign := 1.0
+	sign := int32(1)
 	i := 0
 	if buf[0] == '-' {
-		sign = -1.0
+		sign = -1
 		i++
 	}
 
 	// integral part
-	intPart := 0.0
+	intPart := int32(0)
 	for ; i < len(buf); i++ {
 		c := buf[i]
 		if c == '.' {
@@ -45,20 +60,21 @@ func parseTemperature(buf []byte) (float64, bool) {
 		if c < '0' || c > '9' {
 			return 0, false
 		}
-		intPart = intPart*10 + float64(c-'0')
+		intPart = intPart*10 + int32(c-'0')
 	}
 
 	// optional single decimal digit
-	fracPart := 0.0
+	fracPart := int32(0)
 	if i < len(buf) {
 		c := buf[i]
 		if c < '0' || c > '9' {
 			return 0, false
 		}
-		fracPart = float64(c-'0') / 10.0
+		fracPart = int32(c - '0')
 	}
 
-	return sign * (intPart + fracPart), true
+	// return fixed-point integer: (intPart * 10 + fracPart) * sign
+	return sign * (intPart*10 + fracPart), true
 }
 
 // processChunk walks over data[start:end) and returns local aggregates.
@@ -90,18 +106,28 @@ func processChunk(data []byte, start, end int) map[string]stationStats {
 			continue // skip empty lines
 		}
 
-		idx := bytes.IndexByte(line, ';')
-		if idx <= 0 || idx >= len(line)-1 {
+		// Scan backwards from the end to find the semicolon
+		// This is faster than bytes.IndexByte which scans forward
+		semicolonIdx := -1
+		for i := len(line) - 1; i >= 0; i-- {
+			if line[i] == ';' {
+				semicolonIdx = i
+				break
+			}
+		}
+		
+		if semicolonIdx <= 0 || semicolonIdx >= len(line)-1 {
 			continue // malformed – ignore
 		}
 
-		station := string(line[:idx])
-		tempBuf := line[idx+1:]
-
-		temp, ok := parseTemperature(tempBuf)
+		// Parse temperature directly from the tail (no slice allocation)
+		temp, ok := parseTemperatureFromBytes(line, semicolonIdx+1, len(line))
 		if !ok {
 			continue // skip invalid values
 		}
+
+		// Station name - only allocate string when needed for map key
+		station := string(line[:semicolonIdx])
 
 		stats := local[station]
 		if stats.count == 0 {
@@ -114,7 +140,7 @@ func processChunk(data []byte, start, end int) map[string]stationStats {
 				stats.max = temp
 			}
 		}
-		stats.sum += temp
+		stats.sum += int64(temp)
 		stats.count++
 		local[station] = stats
 	}
@@ -221,12 +247,16 @@ func main() {
 
 	for _, station := range stations {
 		s := globalStats[station]
-		mean := s.sum / float64(s.count)
 
-		minRounded := math.Round(s.min*10) / 10
-		meanRounded := math.Round(mean*10) / 10
-		maxRounded := math.Round(s.max*10) / 10
+		// Calculate mean in fixed-point, then round to nearest tenth
+		meanFixedPoint := (s.sum + int64(s.count)/2) / int64(s.count) // add half for rounding
 
-		fmt.Printf("%s;%.1f/%.1f/%.1f\n", station, minRounded, meanRounded, maxRounded)
+		// Convert fixed-point integers back to decimal format
+		minInt, minFrac := s.min/10, abs32(s.min%10)
+		meanInt, meanFrac := meanFixedPoint/10, abs64(meanFixedPoint%10)
+		maxInt, maxFrac := s.max/10, abs32(s.max%10)
+
+		fmt.Printf("%s;%d.%d/%d.%d/%d.%d\n", station,
+			minInt, minFrac, meanInt, meanFrac, maxInt, maxFrac)
 	}
 }
